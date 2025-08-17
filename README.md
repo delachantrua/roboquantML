@@ -37,12 +37,6 @@ API_SECRET = "YOUR_BINGX_API_SECRET"
 ```bash
 # Market Maker Bot
 python bingx_market_maker.py
-
-# Telegram Signal Bot  
-python auto_telegram_bot.py
-
-# Reality Check
-python check_bingx_reality.py
 ```
 
 ## ⚠️ Important Notes:
@@ -54,8 +48,8 @@ python check_bingx_reality.py
 
 ## 🔧 Configuration:
 
-- **Leverage**: 5x (Market Maker), 10x (Telegram Bot)
-- **Order Size**: $0.01 ETH (Market Maker), $20 USDT (Telegram)
+- **Leverage**: 5x (Market Maker)
+- **Order Size**: $0.01 ETH (Market Maker)
 - **Risk Management**: Built-in inventory limits
 - **ML Features**: Real-time forward testing
 
@@ -63,7 +57,6 @@ python check_bingx_reality.py
 
 ✅ **Market Making**: Professional Avellaneda-Stoikov strategy  
 ✅ **Machine Learning**: Forward testing (better than backtesting)  
-✅ **Telegram Integration**: Automatic signal reading  
 ✅ **Risk Management**: Position sizing, inventory control  
 ✅ **Real-time Monitoring**: Live P&L, order status  
 ✅ **BingX Optimized**: Hedge mode, futures trading  
