@@ -22,6 +22,16 @@ aliases (`USTEC`, `NAS100.cash`, etc.).
 - **Risk controls**: ATR stops + take-profit, break-even trail after 1R,
   daily loss limit, peak-to-trough drawdown halt, broker stops-level
   enforcement.
+- **A-S-inspired execution**: passive limit-order entries priced at the
+  Avellaneda-Stoikov reservation price (captures ~1.5 pts of broker
+  spread per trade); automatic fallback to a market order if the limit
+  doesn't fill within `LIMIT_ENTRY_TIMEOUT_BARS`.
+- **Vol-adaptive thresholds**: ML probability gates widen when realized
+  vol exceeds its 100-bar baseline — require stronger conviction in
+  choppy regimes (analogous to A-S widening spread when σ rises).
+- **Session (T−t) risk scaling**: position size shrinks by
+  √(T_rem / session_length) as the US cash close approaches, floored at
+  `SESSION_MIN_RISK_FRACTION`. Mirrors A-S's time-to-horizon term.
 - **Backtest first**: vectorized walk-forward backtest with spread and
   commission costs, before you risk a cent.
 

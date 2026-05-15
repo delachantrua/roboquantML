@@ -101,6 +101,26 @@ ALLOW_OUT_OF_HOURS: bool = False                # if True, also trade during the
 ORDER_DEVIATION_PTS: int = 20                   # max slippage in points for market orders
 ORDER_FILLING_MODE_PREFERENCE: tuple = ("IOC", "FOK", "RETURN")
 
+# --- A-S-inspired entry pricing & risk shaping ---
+# We don't market-make on NAS100 (broker spread is fixed), but A-S still tells
+# us (a) where the optimal *passive* entry sits, (b) how to react to vol, and
+# (c) how to scale risk as session close approaches.
+ENTRY_USE_LIMIT: bool = True                    # try passive entry first, fall back to market
+AS_GAMMA: float = 1e-5                          # risk aversion, 1/USD (calibrate per equity)
+AS_K: float = 1.5                               # market-impact / fill-intensity coefficient
+LIMIT_ENTRY_TIMEOUT_BARS: int = 2               # cancel unfilled limit after N closed bars
+LIMIT_ENTRY_MAX_OFFSET_ATR: float = 0.5         # cap passive offset at 0.5 * ATR
+LIMIT_ENTRY_FALLBACK_MARKET: bool = True        # market-order if limit didn't fill in time
+
+VOL_ADAPTIVE_THRESHOLDS: bool = True            # widen ML gates when realized vol is elevated
+VOL_RATIO_LOOKBACK: int = 100                   # bars for the "baseline" vol comparison
+VOL_THRESHOLD_MAX_WIDEN: float = 0.10           # at peak vol, push gates ±0.10 outward
+
+SESSION_RISK_SCALING: bool = True               # shrink size as session close approaches
+SESSION_END_UTC_HOUR: int = 20                  # US cash close ≈ 20:00 UTC (4pm ET)
+SESSION_START_UTC_HOUR: int = 13                # US cash open ≈ 13:30 UTC; round to 13 for math
+SESSION_MIN_RISK_FRACTION: float = 0.25         # never scale below 25% of nominal risk
+
 # --- Backtest ---
 BACKTEST_BARS: int = 12000
 BACKTEST_INITIAL_EQUITY: float = 10000.0
@@ -530,6 +550,55 @@ class MT5Broker:
                     f"| ticket={result.order}")
         return True
 
+    def limit_order(self, side: str, lots: float, limit_price: float,
+                    sl_price: float, tp_price: float,
+                    expiration_seconds: int = 0) -> Optional[int]:
+        """Place a pending BUY_LIMIT / SELL_LIMIT order. Returns ticket on
+        success, None on failure."""
+        assert side in ("buy", "sell")
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT if side == "buy" else mt5.ORDER_TYPE_SELL_LIMIT
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": self.symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": round(limit_price, self.meta.digits) if self.meta else limit_price,
+            "sl": round(sl_price, self.meta.digits) if self.meta else sl_price,
+            "tp": round(tp_price, self.meta.digits) if self.meta else tp_price,
+            "deviation": ORDER_DEVIATION_PTS,
+            "magic": DEAL_MAGIC,
+            "comment": "nas100_ml_lim",
+            "type_time": mt5.ORDER_TIME_GTC if expiration_seconds == 0 else mt5.ORDER_TIME_SPECIFIED,
+            "type_filling": self._filling_mode(),
+        }
+        if expiration_seconds > 0:
+            request["expiration"] = int(time.time()) + expiration_seconds
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Limit order failed: {result}")
+            return None
+        logger.info(f"Placed {side.upper()}_LIMIT {lots} @ {limit_price:.{self.meta.digits}f} "
+                    f"| SL={sl_price:.{self.meta.digits}f} TP={tp_price:.{self.meta.digits}f} "
+                    f"| ticket={result.order}")
+        return int(result.order)
+
+    def pending_orders(self) -> list:
+        orders = mt5.orders_get(symbol=self.symbol) or []
+        return [o for o in orders if o.magic == DEAL_MAGIC]
+
+    def cancel_order(self, ticket: int) -> bool:
+        request = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": ticket,
+        }
+        result = mt5.order_send(request)
+        ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+        if ok:
+            logger.info(f"Cancelled pending order {ticket}")
+        else:
+            logger.warning(f"Cancel failed for {ticket}: {result}")
+        return ok
+
     def close_position(self, position) -> bool:
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None:
@@ -572,13 +641,83 @@ class MT5Broker:
 
 
 # ============================================================================
+# AVELLANEDA-STOIKOV HELPERS (entry pricing, vol-adaptive thresholds, T-t)
+# ============================================================================
+
+def session_time_remaining_hours(now_utc: Optional[datetime] = None) -> float:
+    """Hours remaining until the US cash close (≈ SESSION_END_UTC_HOUR UTC).
+    Returns a number in (0, session_length]. Outside the session, returns the
+    full session length (so risk doesn't get crushed during the Asia overlap)."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    session_length = max(1, SESSION_END_UTC_HOUR - SESSION_START_UTC_HOUR)
+    h = now_utc.hour + now_utc.minute / 60.0 + now_utc.second / 3600.0
+    if SESSION_START_UTC_HOUR <= h < SESSION_END_UTC_HOUR:
+        return max(0.1, SESSION_END_UTC_HOUR - h)
+    return float(session_length)
+
+
+def session_risk_multiplier(now_utc: Optional[datetime] = None) -> float:
+    """Scale risk by sqrt(T_rem / session_length) inside the US cash session;
+    full risk outside it. Floors at SESSION_MIN_RISK_FRACTION."""
+    if not SESSION_RISK_SCALING:
+        return 1.0
+    session_length = max(1, SESSION_END_UTC_HOUR - SESSION_START_UTC_HOUR)
+    t_rem = session_time_remaining_hours(now_utc)
+    mult = math.sqrt(t_rem / session_length)
+    return max(SESSION_MIN_RISK_FRACTION, min(1.0, mult))
+
+
+def vol_adaptive_threshold_shift(features: pd.DataFrame) -> float:
+    """How much to push the entry gates outward based on current vol regime.
+
+    Returns Δ in [0, VOL_THRESHOLD_MAX_WIDEN]. Used as:
+        long_gate  = ML_PROB_LONG  + Δ
+        short_gate = ML_PROB_SHORT − Δ
+    so we require stronger conviction when realized vol is elevated.
+    """
+    if not VOL_ADAPTIVE_THRESHOLDS or len(features) < VOL_RATIO_LOOKBACK:
+        return 0.0
+    if "vol_20" not in features.columns:
+        return 0.0
+    recent = features["vol_20"].iloc[-1]
+    baseline = features["vol_20"].iloc[-VOL_RATIO_LOOKBACK:].median()
+    if not (np.isfinite(recent) and np.isfinite(baseline) and baseline > 0):
+        return 0.0
+    ratio = recent / baseline                              # 1.0 = normal vol
+    excess = max(0.0, min(2.0, ratio - 1.0))               # cap at 2× baseline
+    return VOL_THRESHOLD_MAX_WIDEN * (excess / 2.0)
+
+
+def as_entry_limit_price(mid: float, sigma_price: float, time_remaining_h: float,
+                         side: str, atr: float, broker_point: float,
+                         stops_level_pts: int) -> float:
+    """A-S half-spread inside the touch — the passive price we'd quote with
+    zero inventory:
+        δ = (γ · σ_price² · (T−t) + (2/γ) · ln(1 + γ/k)) / 2
+    Capped at LIMIT_ENTRY_MAX_OFFSET_ATR × ATR and at the broker's min stop
+    distance, so we don't sit ridiculously far from the market."""
+    half_spread_risk = AS_GAMMA * sigma_price ** 2 * time_remaining_h
+    half_spread_mi = (2.0 / AS_GAMMA) * math.log(1.0 + AS_GAMMA / AS_K)
+    delta = 0.5 * (half_spread_risk + half_spread_mi)
+
+    max_offset = LIMIT_ENTRY_MAX_OFFSET_ATR * atr
+    min_offset = stops_level_pts * broker_point     # don't violate stops_level
+    delta = max(min_offset, min(delta, max_offset))
+
+    return mid - delta if side == "buy" else mid + delta
+
+
+# ============================================================================
 # POSITION SIZING
 # ============================================================================
 
 def compute_lot_size(equity: float, atr: float, broker: MT5Broker) -> float:
     """
-    Risk-based sizing: lots = (equity * RISK_PER_TRADE) / (stop_distance_pts * tick_value_per_point).
+    Risk-based sizing: lots = (equity * RISK_PER_TRADE * session_mult)
+                              / (stop_distance_pts * tick_value_per_point).
 
+    `session_mult` shrinks risk as the US cash close approaches (A-S T-t).
     tick_value_per_point for NAS100 is typically $1 per point per lot.
     """
     if broker.meta is None or atr <= 0:
@@ -586,13 +725,10 @@ def compute_lot_size(equity: float, atr: float, broker: MT5Broker) -> float:
     stop_points = (STOP_LOSS_ATR_MULT * atr) / broker.meta.point
     if stop_points <= 0:
         return MIN_POSITION_LOTS
-    # value per point per lot
     value_per_point_per_lot = broker.meta.tick_value * (broker.meta.point / broker.meta.tick_size)
-    risk_dollars = equity * RISK_PER_TRADE
+    risk_dollars = equity * RISK_PER_TRADE * session_risk_multiplier()
     lots = risk_dollars / (stop_points * value_per_point_per_lot)
 
-    # Apply vol-target cap: scale down if realized vol is high
-    # (already implicitly handled because stop = k*ATR, but cap with hard ceiling too)
     lots = max(MIN_POSITION_LOTS, min(lots, MAX_POSITION_LOTS))
     # Round to broker step
     step = broker.meta.volume_step or 0.01
@@ -680,6 +816,12 @@ def backtest(df: pd.DataFrame, engine: MLEngine) -> pd.DataFrame:
         next_bar = df.iloc[i + 1] if i + 1 < n else None
         atr = float(atr_all.iloc[i])
 
+        # Vol-adaptive gates for this bar (mirror live trader)
+        bar_features = features_all.iloc[: i + 1]
+        gate_shift = vol_adaptive_threshold_shift(bar_features)
+        long_gate = min(0.95, ML_PROB_LONG + gate_shift)
+        short_gate = max(0.05, ML_PROB_SHORT - gate_shift)
+
         # --- Manage existing position first (intra-bar stop/TP check on next bar) ---
         if position != 0 and next_bar is not None:
             hit_stop = (position > 0 and next_bar["low"] <= stop_px) or \
@@ -692,10 +834,9 @@ def backtest(df: pd.DataFrame, engine: MLEngine) -> pd.DataFrame:
             elif hit_tp:
                 exit_px = tp_px
             else:
-                # Exit on opposing signal
-                if position > 0 and p_up <= ML_PROB_SHORT:
+                if position > 0 and p_up <= short_gate:
                     exit_px = next_bar["open"]
-                elif position < 0 and p_up >= ML_PROB_LONG:
+                elif position < 0 and p_up >= long_gate:
                     exit_px = next_bar["open"]
             if exit_px is not None:
                 pnl_pts = (exit_px - entry_price) * position / point
@@ -722,9 +863,9 @@ def backtest(df: pd.DataFrame, engine: MLEngine) -> pd.DataFrame:
         # --- Open new position if flat ---
         if position == 0 and next_bar is not None and not math.isnan(atr) and atr > 0:
             side = 0
-            if p_up >= ML_PROB_LONG:
+            if p_up >= long_gate:
                 side = +1
-            elif p_up <= ML_PROB_SHORT:
+            elif p_up <= short_gate:
                 side = -1
             if side != 0:
                 # Risk-based sizing for backtest (mirror live)
@@ -782,6 +923,13 @@ class Trader:
         self.halted_for_day: bool = False
         self.bars_seen: int = 0
         self.last_bar_time: Optional[int] = None
+        # A-S limit-order tracking
+        self.pending_ticket: Optional[int] = None
+        self.pending_side: Optional[str] = None
+        self.pending_placed_bar: Optional[int] = None
+        self.pending_sl: float = 0.0
+        self.pending_tp: float = 0.0
+        self.pending_lots: float = 0.0
 
     def _session_reset_if_new_day(self) -> None:
         now = datetime.now(timezone.utc)
@@ -816,6 +964,105 @@ class Trader:
         if need_train:
             self.engine.fit(df)
             self.engine.save()
+
+    def _has_pending_for_us(self) -> bool:
+        if self.pending_ticket is None:
+            return False
+        pending = self.broker.pending_orders()
+        return any(o.ticket == self.pending_ticket for o in pending)
+
+    def _clear_pending_state(self) -> None:
+        self.pending_ticket = None
+        self.pending_side = None
+        self.pending_placed_bar = None
+        self.pending_sl = 0.0
+        self.pending_tp = 0.0
+        self.pending_lots = 0.0
+
+    def _handle_entry(self, p_up: float, mid: float, atr: float, tick,
+                      long_gate: float, short_gate: float, new_bar: bool) -> None:
+        """Open a new position. Tries an A-S passive limit first; falls back
+        to market after LIMIT_ENTRY_TIMEOUT_BARS closed bars."""
+        side: Optional[str] = None
+        if p_up >= long_gate:
+            side = "buy"
+        elif p_up <= short_gate:
+            side = "sell"
+
+        # Cancel a pending order whose signal no longer applies
+        if self._has_pending_for_us() and self.pending_side != side:
+            self.broker.cancel_order(self.pending_ticket)
+            self._clear_pending_state()
+
+        # Pending order still alive: check timeout, otherwise wait for fill
+        if self._has_pending_for_us():
+            assert self.pending_placed_bar is not None
+            bars_waited = self.bars_seen - self.pending_placed_bar
+            if bars_waited >= LIMIT_ENTRY_TIMEOUT_BARS:
+                logger.info(f"Limit entry timed out after {bars_waited} bars; cancelling")
+                self.broker.cancel_order(self.pending_ticket)
+                fallback_side = self.pending_side
+                fallback_lots = self.pending_lots
+                fallback_sl = self.pending_sl
+                fallback_tp = self.pending_tp
+                self._clear_pending_state()
+                if LIMIT_ENTRY_FALLBACK_MARKET and side == fallback_side:
+                    logger.info("Falling back to market order")
+                    self.broker.market_order(fallback_side, fallback_lots, fallback_sl, fallback_tp)
+            return
+
+        if side is None or not new_bar:
+            return
+        if len(self.broker.open_positions()) >= MAX_OPEN_POSITIONS:
+            return
+
+        # Size and stops
+        equity = self.broker.account_equity()
+        lots = compute_lot_size(equity, atr, self.broker)
+        sign = +1 if side == "buy" else -1
+        sl = (tick.ask if side == "buy" else tick.bid) - sign * STOP_LOSS_ATR_MULT * atr
+        tp = (tick.ask if side == "buy" else tick.bid) + sign * TAKE_PROFIT_ATR_MULT * atr
+        if self.broker.meta:
+            min_dist = self.broker.meta.stops_level * self.broker.meta.point
+            ref_px = tick.ask if side == "buy" else tick.bid
+            if abs(ref_px - sl) < min_dist:
+                sl = ref_px - sign * (min_dist * 1.1)
+            if abs(tp - ref_px) < min_dist:
+                tp = ref_px + sign * (min_dist * 1.1)
+
+        if not ENTRY_USE_LIMIT:
+            self.broker.market_order(side, lots, sl, tp)
+            return
+
+        # A-S passive entry pricing
+        sigma_price = atr / max(1.0, math.sqrt(ATR_PERIOD))   # ATR-derived price-vol proxy
+        t_rem = session_time_remaining_hours()
+        meta = self.broker.meta
+        limit_px = as_entry_limit_price(
+            mid=mid, sigma_price=sigma_price, time_remaining_h=t_rem,
+            side=side, atr=atr,
+            broker_point=meta.point if meta else 0.01,
+            stops_level_pts=meta.stops_level if meta else 0,
+        )
+        # Don't place a buy limit ABOVE bid or a sell limit BELOW ask (would
+        # market-fill or fail). Keep one tick inside the touch.
+        if side == "buy":
+            limit_px = min(limit_px, tick.bid - (meta.point if meta else 0.0))
+        else:
+            limit_px = max(limit_px, tick.ask + (meta.point if meta else 0.0))
+
+        ticket = self.broker.limit_order(side, lots, limit_px, sl, tp,
+                                         expiration_seconds=LIMIT_ENTRY_TIMEOUT_BARS * _timeframe_seconds(TIMEFRAME_NAME) + 60)
+        if ticket is None:
+            logger.warning("Limit placement failed; falling back to market")
+            self.broker.market_order(side, lots, sl, tp)
+            return
+        self.pending_ticket = ticket
+        self.pending_side = side
+        self.pending_placed_bar = self.bars_seen
+        self.pending_sl = sl
+        self.pending_tp = tp
+        self.pending_lots = lots
 
     def _trail_stop(self, position, current_price: float, atr: float) -> None:
         """Move stop to break-even after price moves 1R in our favor."""
@@ -896,51 +1143,34 @@ class Trader:
                     continue
                 mid = (tick.bid + tick.ask) / 2.0
 
+                # Vol-adaptive entry gates (A-S inspired: harder entry in high-vol regime)
+                gate_shift = vol_adaptive_threshold_shift(features)
+                long_gate = min(0.95, ML_PROB_LONG + gate_shift)
+                short_gate = max(0.05, ML_PROB_SHORT - gate_shift)
+
                 # Manage existing position
                 positions = self.broker.open_positions()
                 if positions:
                     pos = positions[0]
                     self._trail_stop(pos, mid, atr)
-                    # Exit on opposing signal
-                    if pos.type == mt5.POSITION_TYPE_BUY and p_up <= ML_PROB_SHORT:
+                    if pos.type == mt5.POSITION_TYPE_BUY and p_up <= short_gate:
                         logger.info(f"ML signal flipped to short (p_up={p_up:.3f}); closing long")
                         self.broker.close_position(pos)
-                    elif pos.type == mt5.POSITION_TYPE_SELL and p_up >= ML_PROB_LONG:
+                    elif pos.type == mt5.POSITION_TYPE_SELL and p_up >= long_gate:
                         logger.info(f"ML signal flipped to long (p_up={p_up:.3f}); closing short")
                         self.broker.close_position(pos)
                 else:
-                    # Open new position?
-                    if len(self.broker.open_positions()) < MAX_OPEN_POSITIONS:
-                        side: Optional[str] = None
-                        if p_up >= ML_PROB_LONG:
-                            side = "buy"
-                        elif p_up <= ML_PROB_SHORT:
-                            side = "sell"
-                        if side and new_bar:  # only act once per bar
-                            equity = self.broker.account_equity()
-                            lots = compute_lot_size(equity, atr, self.broker)
-                            sign = +1 if side == "buy" else -1
-                            entry_px = tick.ask if side == "buy" else tick.bid
-                            sl = entry_px - sign * STOP_LOSS_ATR_MULT * atr
-                            tp = entry_px + sign * TAKE_PROFIT_ATR_MULT * atr
-                            # Respect broker minimum stop distance
-                            if self.broker.meta:
-                                min_dist = self.broker.meta.stops_level * self.broker.meta.point
-                                if abs(entry_px - sl) < min_dist:
-                                    sl = entry_px - sign * (min_dist * 1.1)
-                                if abs(tp - entry_px) < min_dist:
-                                    tp = entry_px + sign * (min_dist * 1.1)
-                            logger.info(f"Signal: p_up={p_up:.3f} -> {side.upper()} {lots} lots "
-                                        f"@ ~{entry_px:.2f} | SL {sl:.2f} TP {tp:.2f} | ATR={atr:.2f}")
-                            self.broker.market_order(side, lots, sl, tp)
+                    self._handle_entry(p_up, mid, atr, tick, long_gate, short_gate, new_bar)
 
                 # Status line
                 equity = self.broker.account_equity()
                 dd = (1 - equity / self.peak_equity) * 100 if self.peak_equity > 0 else 0
+                t_rem = session_time_remaining_hours()
+                risk_mult = session_risk_multiplier()
                 logger.info(
-                    f"NAS100 mid={mid:.2f} | p_up={p_up:.3f} | ATR={atr:.2f} | "
-                    f"equity=${equity:,.2f} | dd={dd:.2f}% | "
-                    f"open={len(self.broker.open_positions())} | bars={self.bars_seen}"
+                    f"NAS100 mid={mid:.2f} | p_up={p_up:.3f} (gates {short_gate:.2f}/{long_gate:.2f}) | "
+                    f"ATR={atr:.2f} | T-rem={t_rem:.1f}h | risk×{risk_mult:.2f} | "
+                    f"equity=${equity:,.2f} | dd={dd:.2f}% | open={len(positions)} | bars={self.bars_seen}"
                 )
                 time.sleep(POLL_INTERVAL_SEC)
 
