@@ -40,7 +40,34 @@ isn't visible on your broker.
 - **Backtest first**: vectorized walk-forward backtest with spread and
   commission costs, before you risk a cent.
 
-### 2. BingX Market Maker — `bingx_market_maker.py`
+### 2. NAS100ft M1 Scalper (MT5) — `nas100_scalper.py`
+
+Regime-switching scalper for the Nasdaq-100 CFD. Trends-pullbacks in
+trending tape, Bollinger mean-reversion in ranges, ADX picks the regime.
+
+**Tuned for cent accounts** ("let winners run" mode):
+
+- Three-stage scale-out: 25% off at +1R, 35% off at +2.5R, 40% runner
+  on a wide adaptive Chandelier trail.
+- Optional higher-timeframe ATR for the trail (M5 by default) — enters
+  precisely on M1, breathes on M5, so noise doesn't stop you out of a
+  multi-hour move.
+- Lot size scales with equity (`risk_per_trade × equity / stop_dist`)
+  AND has an equity-tier cap (1 lot per `EQUITY_PER_LOT_USD`), so the
+  bot grows your position as the account grows but won't oversize on a
+  drawdown.
+- Optional anti-martingale win-streak boost: +8% size per consecutive
+  winner past 3 in a row, capped at +30%.
+- Hard daily kill switches: -2.5% halts the day, +4% locks gains,
+  max 25 trades / day, 20-minute cooldown after 2 consecutive losses.
+- Spread filter: skips entries when current spread > 2.5 pts.
+- Session filter: US cash hours only (14:00-19:00 UTC default).
+
+Backtest with `python nas100_scalper.py --backtest --bars 30000` before
+ever running live. Even with cent-account economics, M1 scalping is
+unforgiving; validate on a month of data first.
+
+### 3. BingX Market Maker — `bingx_market_maker.py`
 
 Avellaneda–Stoikov market-making bot for BingX perpetual futures with an
 ML "forward testing" layer.
