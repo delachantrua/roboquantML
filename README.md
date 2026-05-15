@@ -8,8 +8,9 @@ ML directional bot for MetaTrader 5.
 ### 1. NAS100 ML Trader (MT5) — `nas100_ml_trader.py`
 
 Directional machine-learning bot for the Nasdaq-100 CFD on MetaTrader 5.
-Tested against VT Markets (`NAS100`) but auto-discovers common symbol
-aliases (`USTEC`, `NAS100.cash`, etc.).
+Defaults to VT Markets' `NAS100ft` symbol and auto-discovers common
+aliases (`NAS100`, `NAS100.cash`, `USTEC`, `NDX100`, …) if the default
+isn't visible on your broker.
 
 - **Strategy**: Gradient-boosting + random-forest ensemble predicts the
   sign of the next N-bar log return; positions sized by risk-per-trade

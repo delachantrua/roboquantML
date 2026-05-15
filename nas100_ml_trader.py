@@ -65,8 +65,13 @@ MT5_SERVER: str = "VTMarkets-Demo"              # e.g. "VTMarkets-Live" / "VTMar
 MT5_TERMINAL_PATH: str = ""                     # Optional: full path to terminal64.exe
 
 # --- Instrument ---
-SYMBOL: str = "NAS100"                          # VT Markets Nasdaq-100 CFD. Some brokers use "USTEC", "NDX100", "NQ100".
-SYMBOL_ALIASES: tuple[str, ...] = ("NAS100", "NAS100.cash", "NAS100m", "USTEC", "USTECm", "USTEC100", "NDX100", "NQ100")
+SYMBOL: str = "NAS100ft"                        # VT Markets Nasdaq-100 CFD futures symbol
+SYMBOL_ALIASES: tuple[str, ...] = (
+    "NAS100ft", "NAS100.ft", "NAS100",
+    "NAS100.cash", "NAS100m", "NAS100c",
+    "USTEC", "USTECm", "USTEC100", "USTECft",
+    "NDX100", "NQ100",
+)
 TIMEFRAME_NAME: str = "M15"                     # M1, M5, M15, M30, H1, H4, D1
 DEAL_MAGIC: int = 20260515                      # tag used to identify this bot's trades
 
