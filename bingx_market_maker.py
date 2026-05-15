@@ -269,77 +269,122 @@ class BingXMarketMaker:
             logger.error(f"Error creating ML labels: {e}")
             return None
     
+    def _calculate_features_for_snapshot(self, prices: list, volumes: list) -> np.ndarray:
+        """Compute the same feature vector as `calculate_ml_features`, but from
+        an explicit snapshot of prices/volumes instead of mutating instance
+        state. This avoids corrupting self.price_history during training."""
+        if len(prices) < 50:
+            return None
+        prices_arr = np.array(prices, dtype=float)
+        volumes_arr = np.array(volumes, dtype=float) if volumes else np.ones_like(prices_arr)
+
+        returns = np.diff(np.log(prices_arr))
+        price_momentum = prices_arr[-1] / prices_arr[-20] - 1 if len(prices_arr) >= 20 else 0
+
+        volatility_5 = np.std(returns[-5:]) if len(returns) >= 5 else 0
+        volatility_20 = np.std(returns[-20:]) if len(returns) >= 20 else 0
+        volatility_50 = np.std(returns[-50:]) if len(returns) >= 50 else 0
+
+        ma_5 = np.mean(prices_arr[-5:]) if len(prices_arr) >= 5 else prices_arr[-1]
+        ma_20 = np.mean(prices_arr[-20:]) if len(prices_arr) >= 20 else prices_arr[-1]
+        ma_50 = np.mean(prices_arr[-50:]) if len(prices_arr) >= 50 else prices_arr[-1]
+
+        gains = np.sum(returns[returns > 0][-14:]) if len(returns) >= 14 else 0
+        losses = np.abs(np.sum(returns[returns < 0][-14:])) if len(returns) >= 14 else 0
+        rsi = gains / (gains + losses) if (gains + losses) > 0 else 0.5
+
+        volume_ma = np.mean(volumes_arr[-20:]) if len(volumes_arr) >= 20 else 1
+        volume_ratio = volumes_arr[-1] / volume_ma if volume_ma > 0 else 1
+
+        bb_upper = ma_20 + 2 * volatility_20 * ma_20
+        bb_lower = ma_20 - 2 * volatility_20 * ma_20
+        bb_position = (prices_arr[-1] - bb_lower) / (bb_upper - bb_lower) if (bb_upper - bb_lower) > 0 else 0.5
+
+        macd = ma_5 - ma_20
+        macd_signal = ma_5 - ma_50
+
+        higher_highs = np.sum(np.diff(prices_arr[-10:]) > 0) if len(prices_arr) >= 10 else 0
+        lower_lows = np.sum(np.diff(prices_arr[-10:]) < 0) if len(prices_arr) >= 10 else 0
+
+        return np.array([
+            prices_arr[-1], prices_arr[-5], prices_arr[-10], prices_arr[-20],
+            returns[-1], returns[-5], returns[-10],
+            volatility_5, volatility_20, volatility_50,
+            ma_5, ma_20, ma_50,
+            rsi, bb_position,
+            macd, macd_signal,
+            volume_ratio,
+            higher_highs, lower_lows,
+            price_momentum,
+        ])
+
     def train_ml_model(self) -> None:
         """Train the machine learning model"""
         try:
             if not ML_ENABLED or len(self.price_history) < ML_LOOKBACK:
                 return
-            
+
             logger.info("🧠 Training ML model...")
-            
-            # Prepare features and labels
+
+            prices_full = list(self.price_history)
+            volumes_full = list(self.volume_history) if self.volume_history else [1.0] * len(prices_full)
+
             features_list = []
             labels_list = []
-            
-            # Create training data from historical data
-            for i in range(50, len(self.price_history) - 10):
-                # Get features for this point in time
-                temp_prices = list(self.price_history)[:i+1]
-                temp_volumes = list(self.volume_history)[:i+1] if self.volume_history else [1] * len(temp_prices)
-                
-                # Calculate features
-                self.price_history = deque(temp_prices, maxlen=ML_LOOKBACK)
-                self.volume_history = deque(temp_volumes, maxlen=ML_LOOKBACK)
-                
-                features = self.calculate_ml_features()
-                if features is not None:
-                    features_list.append(features.flatten())
-                    
-                    # Calculate future return
-                    if i + 10 < len(temp_prices):
-                        future_return = (temp_prices[i + 10] - temp_prices[i]) / temp_prices[i]
-                        labels_list.append(1 if future_return > 0 else 0)
-            
+
+            # Build training samples WITHOUT mutating self.price_history.
+            # Each sample uses information available up to bar i; label looks
+            # forward 10 bars from i.
+            for i in range(50, len(prices_full) - 10):
+                feat = self._calculate_features_for_snapshot(
+                    prices_full[: i + 1], volumes_full[: i + 1]
+                )
+                if feat is None:
+                    continue
+                future_return = (prices_full[i + 10] - prices_full[i]) / prices_full[i]
+                features_list.append(feat)
+                labels_list.append(1 if future_return > 0 else 0)
+
             if len(features_list) < 100:
                 logger.warning("Insufficient data for ML training")
                 return
-            
-            # Convert to numpy arrays
+
             X = np.array(features_list)
             y = np.array(labels_list)
-            
-            # Feature selection
-            self.ml_feature_selector = SelectKBest(score_func=f_regression, k=ML_FEATURE_COUNT)
+
+            # Feature selection (f_classif is more appropriate than f_regression for binary labels)
+            from sklearn.feature_selection import f_classif
+            self.ml_feature_selector = SelectKBest(score_func=f_classif, k=min(ML_FEATURE_COUNT, X.shape[1]))
             X_selected = self.ml_feature_selector.fit_transform(X, y)
-            
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.2, random_state=42)
-            
-            # Scale features
+
+            # Time-ordered split (NO shuffle) to avoid look-ahead leakage
+            split_idx = int(len(X_selected) * 0.8)
+            X_train, X_test = X_selected[:split_idx], X_selected[split_idx:]
+            y_train, y_test = y[:split_idx], y[split_idx:]
+
             self.ml_scaler = StandardScaler()
             X_train_scaled = self.ml_scaler.fit_transform(X_train)
             X_test_scaled = self.ml_scaler.transform(X_test)
-            
-            # Train model
+
             self.ml_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
             self.ml_model.fit(X_train_scaled, y_train)
-            
-            # Evaluate model
-            y_pred = self.ml_model.predict(X_test_scaled)
-            accuracy = accuracy_score(y_test, y_pred)
-            precision = precision_score(y_test, y_pred, zero_division=0)
-            recall = recall_score(y_test, y_pred, zero_division=0)
-            f1 = f1_score(y_test, y_pred, zero_division=0)
-            
-            logger.info(f"✅ ML Model trained successfully!")
-            logger.info(f"📊 Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
-            
+
+            if len(y_test) > 0:
+                y_pred = self.ml_model.predict(X_test_scaled)
+                accuracy = accuracy_score(y_test, y_pred)
+                precision = precision_score(y_test, y_pred, zero_division=0)
+                recall = recall_score(y_test, y_pred, zero_division=0)
+                f1 = f1_score(y_test, y_pred, zero_division=0)
+                logger.info(f"✅ ML Model trained successfully!")
+                logger.info(f"📊 Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, "
+                            f"Recall: {recall:.3f}, F1: {f1:.3f}")
+            else:
+                logger.info("✅ ML Model trained (no held-out samples)")
+
             self.ml_trained = True
             self.ml_last_update = time.time()
-            
-            # Save model
             self.save_ml_model()
-            
+
         except Exception as e:
             logger.error(f"Error training ML model: {e}")
     
