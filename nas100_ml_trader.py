@@ -105,12 +105,22 @@ ORDER_FILLING_MODE_PREFERENCE: tuple = ("IOC", "FOK", "RETURN")
 # We don't market-make on NAS100 (broker spread is fixed), but A-S still tells
 # us (a) where the optimal *passive* entry sits, (b) how to react to vol, and
 # (c) how to scale risk as session close approaches.
+#
+# References:
+#   Avellaneda & Stoikov (2008), "High-frequency trading in a limit order book"
+#     https://people.orie.cornell.edu/sfs33/LimitOrderBook.pdf
+#   Hummingbot Avellaneda strategy:
+#     https://hummingbot.org/strategies/v1-strategies/avellaneda-market-making/
 ENTRY_USE_LIMIT: bool = True                    # try passive entry first, fall back to market
-AS_GAMMA: float = 1e-5                          # risk aversion, 1/USD (calibrate per equity)
-AS_K: float = 1.5                               # market-impact / fill-intensity coefficient
+AS_GAMMA: float = 1e-5                          # γ — risk aversion in 1/USD
+AS_K: float = 1.5                               # κ fallback (auto-estimated from data when possible)
+AS_AUTO_CALIBRATE_K: bool = True                # fit κ from historical bar excursions
+AS_K_CALIB_LOOKBACK: int = 500                  # bars used to fit κ
+AS_VOL_ESTIMATOR: str = "garman_klass"          # "garman_klass" (OHLC, efficient) or "atr"
 LIMIT_ENTRY_TIMEOUT_BARS: int = 2               # cancel unfilled limit after N closed bars
 LIMIT_ENTRY_MAX_OFFSET_ATR: float = 0.5         # cap passive offset at 0.5 * ATR
 LIMIT_ENTRY_FALLBACK_MARKET: bool = True        # market-order if limit didn't fill in time
+MIN_SPREAD_BPS: float = 1.0                     # floor on the A-S half-spread offset (bps of mid)
 
 VOL_ADAPTIVE_THRESHOLDS: bool = True            # widen ML gates when realized vol is elevated
 VOL_RATIO_LOOKBACK: int = 100                   # bars for the "baseline" vol comparison
@@ -644,6 +654,67 @@ class MT5Broker:
 # AVELLANEDA-STOIKOV HELPERS (entry pricing, vol-adaptive thresholds, T-t)
 # ============================================================================
 
+def garman_klass_sigma(df: pd.DataFrame, lookback: int = 100) -> float:
+    """OHLC-based volatility estimator (Garman-Klass 1980), in absolute price
+    units per √bar. ~7x more statistically efficient than close-to-close on
+    the same data.
+
+        σ²_GK = 0.5·(ln(H/L))² − (2·ln 2 − 1)·(ln(C/O))²
+    """
+    if len(df) < 2:
+        return 0.0
+    sub = df.iloc[-lookback:]
+    h, l, o, c = sub["high"], sub["low"], sub["open"], sub["close"]
+    rs_hl = np.log(h / l) ** 2
+    rs_co = np.log(c / o) ** 2
+    gk_var = 0.5 * rs_hl - (2 * np.log(2) - 1) * rs_co
+    gk_var = gk_var.clip(lower=0).mean()
+    sigma_logret = math.sqrt(max(gk_var, 1e-12))
+    return sigma_logret * float(c.iloc[-1])    # → σ_price
+
+
+def calibrate_kappa(df: pd.DataFrame, lookback: int = AS_K_CALIB_LOOKBACK,
+                    fallback: float = AS_K) -> float:
+    """Estimate κ in λ(δ) = A·exp(−κ·δ) from historical bar excursions.
+
+    For each bar we compute how far below the open the low went (long-side
+    excursion) and how far above the open the high went (short-side
+    excursion). Empirical fill probability of a passive limit at offset δ
+    ≈ P(excursion ≥ δ). Under the A-S model that probability is monotonic
+    in λ(δ), so log fill-rate is linear in δ with slope −κ. We fit κ via
+    least squares on a small offset grid scaled to the median excursion.
+    """
+    if len(df) < lookback + 10:
+        return fallback
+    sub = df.iloc[-lookback:]
+    o = sub["open"].values
+    long_excursion = np.maximum(0.0, o - sub["low"].values)
+    short_excursion = np.maximum(0.0, sub["high"].values - o)
+    excursion = np.concatenate([long_excursion, short_excursion])
+    excursion = excursion[excursion > 0]
+    if len(excursion) < 50:
+        return fallback
+
+    median_exc = float(np.median(excursion))
+    if median_exc <= 0:
+        return fallback
+    # Offsets at 0.25, 0.5, 0.75, 1.0, 1.5, 2.0 of the median excursion
+    grid = np.array([0.25, 0.5, 0.75, 1.0, 1.5, 2.0]) * median_exc
+    fill_rates = np.array([(excursion >= d).mean() for d in grid])
+    # Drop zero / one fill rates (boundary)
+    mask = (fill_rates > 0.02) & (fill_rates < 0.98)
+    if mask.sum() < 3:
+        return fallback
+    x = grid[mask]
+    y = np.log(fill_rates[mask])
+    # Linear regression y = a − κ·x  → slope = −κ
+    slope, _ = np.polyfit(x, y, 1)
+    kappa = float(-slope)
+    if not np.isfinite(kappa) or kappa <= 0:
+        return fallback
+    # Clamp to a sane range
+    return float(np.clip(kappa, 1e-3, 100.0))
+
 def session_time_remaining_hours(now_utc: Optional[datetime] = None) -> float:
     """Hours remaining until the US cash close (≈ SESSION_END_UTC_HOUR UTC).
     Returns a number in (0, session_length]. Outside the session, returns the
@@ -691,18 +762,23 @@ def vol_adaptive_threshold_shift(features: pd.DataFrame) -> float:
 
 def as_entry_limit_price(mid: float, sigma_price: float, time_remaining_h: float,
                          side: str, atr: float, broker_point: float,
-                         stops_level_pts: int) -> float:
+                         stops_level_pts: int, kappa: float = AS_K) -> float:
     """A-S half-spread inside the touch — the passive price we'd quote with
     zero inventory:
-        δ = (γ · σ_price² · (T−t) + (2/γ) · ln(1 + γ/k)) / 2
-    Capped at LIMIT_ENTRY_MAX_OFFSET_ATR × ATR and at the broker's min stop
-    distance, so we don't sit ridiculously far from the market."""
+        δ = (γ · σ_price² · (T−t) + (2/γ) · ln(1 + γ/κ)) / 2
+
+    σ_price comes from Garman-Klass on OHLC bars (or ATR fallback), κ is
+    auto-calibrated from historical bar excursions. Capped by ATR and the
+    broker's stops_level so the limit sits in a sensible band."""
     half_spread_risk = AS_GAMMA * sigma_price ** 2 * time_remaining_h
-    half_spread_mi = (2.0 / AS_GAMMA) * math.log(1.0 + AS_GAMMA / AS_K)
+    half_spread_mi = (2.0 / AS_GAMMA) * math.log(1.0 + AS_GAMMA / max(kappa, 1e-9))
     delta = 0.5 * (half_spread_risk + half_spread_mi)
 
     max_offset = LIMIT_ENTRY_MAX_OFFSET_ATR * atr
-    min_offset = stops_level_pts * broker_point     # don't violate stops_level
+    min_offset = max(
+        stops_level_pts * broker_point,             # broker stops_level
+        (MIN_SPREAD_BPS / 10000.0) * mid,           # min_spread floor (Hummingbot-style)
+    )
     delta = max(min_offset, min(delta, max_offset))
 
     return mid - delta if side == "buy" else mid + delta
@@ -980,7 +1056,8 @@ class Trader:
         self.pending_lots = 0.0
 
     def _handle_entry(self, p_up: float, mid: float, atr: float, tick,
-                      long_gate: float, short_gate: float, new_bar: bool) -> None:
+                      long_gate: float, short_gate: float, new_bar: bool,
+                      df: Optional[pd.DataFrame] = None) -> None:
         """Open a new position. Tries an A-S passive limit first; falls back
         to market after LIMIT_ENTRY_TIMEOUT_BARS closed bars."""
         side: Optional[str] = None
@@ -1034,8 +1111,13 @@ class Trader:
             self.broker.market_order(side, lots, sl, tp)
             return
 
-        # A-S passive entry pricing
-        sigma_price = atr / max(1.0, math.sqrt(ATR_PERIOD))   # ATR-derived price-vol proxy
+        # A-S passive entry pricing — σ from Garman-Klass OHLC, κ calibrated to data
+        if AS_VOL_ESTIMATOR == "garman_klass" and df is not None and len(df) > 50:
+            sigma_price = garman_klass_sigma(df, lookback=100)
+        else:
+            sigma_price = atr / max(1.0, math.sqrt(ATR_PERIOD))
+        kappa = (calibrate_kappa(df) if (AS_AUTO_CALIBRATE_K and df is not None)
+                 else AS_K)
         t_rem = session_time_remaining_hours()
         meta = self.broker.meta
         limit_px = as_entry_limit_price(
@@ -1043,6 +1125,7 @@ class Trader:
             side=side, atr=atr,
             broker_point=meta.point if meta else 0.01,
             stops_level_pts=meta.stops_level if meta else 0,
+            kappa=kappa,
         )
         # Don't place a buy limit ABOVE bid or a sell limit BELOW ask (would
         # market-fill or fail). Keep one tick inside the touch.
@@ -1160,7 +1243,7 @@ class Trader:
                         logger.info(f"ML signal flipped to long (p_up={p_up:.3f}); closing short")
                         self.broker.close_position(pos)
                 else:
-                    self._handle_entry(p_up, mid, atr, tick, long_gate, short_gate, new_bar)
+                    self._handle_entry(p_up, mid, atr, tick, long_gate, short_gate, new_bar, df=df)
 
                 # Status line
                 equity = self.broker.account_equity()

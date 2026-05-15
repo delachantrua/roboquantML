@@ -25,7 +25,11 @@ aliases (`USTEC`, `NAS100.cash`, etc.).
 - **A-S-inspired execution**: passive limit-order entries priced at the
   Avellaneda-Stoikov reservation price (captures ~1.5 pts of broker
   spread per trade); automatic fallback to a market order if the limit
-  doesn't fill within `LIMIT_ENTRY_TIMEOUT_BARS`.
+  doesn't fill within `LIMIT_ENTRY_TIMEOUT_BARS`. σ_price uses the
+  Garman-Klass OHLC estimator (≈7× more efficient than close-to-close);
+  the market-impact coefficient **κ is auto-calibrated** from historical
+  bar excursions by fitting `λ(δ) = A·exp(−κ·δ)` (Hummingbot-style),
+  with a hardcoded fallback if data is sparse.
 - **Vol-adaptive thresholds**: ML probability gates widen when realized
   vol exceeds its 100-bar baseline — require stronger conviction in
   choppy regimes (analogous to A-S widening spread when σ rises).
