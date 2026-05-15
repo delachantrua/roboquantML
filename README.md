@@ -25,10 +25,26 @@ aliases (`USTEC`, `NAS100.cash`, etc.).
 - **Backtest first**: vectorized walk-forward backtest with spread and
   commission costs, before you risk a cent.
 
-### 2. BingX Market Maker (legacy) — `bingx_market_maker.py`
+### 2. BingX Market Maker — `bingx_market_maker.py`
 
 Avellaneda–Stoikov market-making bot for BingX perpetual futures with an
-ML "forward testing" layer. Kept for the crypto use case.
+ML "forward testing" layer.
+
+Implements the canonical 2008 limited-horizon model (see the
+[fedecaccia/avellaneda-stoikov reference][as-ref]):
+
+```
+r(t)   = s(t) − q · γ · σ_price² · (T − t)
+spread = γ · σ_price² · (T − t) + (2/γ) · ln(1 + γ/k)
+ra = r + spread/2,  rb = r − spread/2
+```
+
+σ_price = σ_logret · s, so all quantities are in dollars. `GAMMA` is in
+units of 1/dollar; `INVENTORY_AVERSION_SCALE` (default 1.0 = canonical)
+lets you skew quotes harder against inventory without widening the
+spread.
+
+[as-ref]: https://deepwiki.com/fedecaccia/avellaneda-stoikov/2-avellaneda-stoikov-model
 
 ## Setup
 

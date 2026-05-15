@@ -53,13 +53,18 @@ LEVERAGE = 5  # Leverage multiplier
 ORDER_SIZE_FIXED = 0.01  # Fixed order size in ETH (matches server)
 ORDER_SIZE_PERCENT = 0.02  # Fallback percentage if fixed size fails
 
-# Avellaneda-Stoikov Parameters (Exact Server Match)
-GAMMA = 0.01  # Risk aversion parameter (γ) - Controls spread width
-K = 5.0  # Market impact parameter (k) - For fill intensity modeling  
-ALPHA = 0.001  # Inventory penalty parameter (α) - Separate from gamma
-TIME_HORIZON = 0.1  # Time horizon in hours (6 minutes) - rolling calculation
-SIGMA_LOOKBACK = 50  # Price history length for volatility (matches server)
-UPDATE_FREQUENCY = 1.0  # Update quotes every 1 second (ultra aggressive)
+# Avellaneda-Stoikov Parameters (canonical 2008 model, limited horizon)
+# Reference: https://deepwiki.com/fedecaccia/avellaneda-stoikov/2-avellaneda-stoikov-model
+#   r(t)     = s(t) − q · γ · σ² · (T − t)
+#   spread   = γ · σ² · (T − t) + (2/γ) · ln(1 + γ/k)
+#   ra = r + spread/2,  rb = r − spread/2
+GAMMA = 0.01  # γ — risk aversion. Drives BOTH spread width and inventory penalty in r(t).
+K = 5.0       # k — market-impact parameter for fill-intensity λ = A·exp(−k·δ).
+INVENTORY_AVERSION_SCALE = 1.0  # multiplier on γ for the reservation-price inventory term;
+                                # 1.0 = canonical A-S, >1 skews quotes harder against inventory.
+TIME_HORIZON = 0.1  # T — horizon in hours (rolling). T-t is reset each cycle.
+SIGMA_LOOKBACK = 50  # Price history length for volatility estimate.
+UPDATE_FREQUENCY = 1.0  # Quote refresh period in seconds.
 
 # Risk Management (Server-tuned)
 MAX_INVENTORY_USD = 200.0  # Maximum inventory in USD
@@ -514,32 +519,44 @@ class BingXMarketMaker:
             logger.error(f"Error validating ML predictions: {e}")
     
     def calculate_volatility(self) -> float:
-        """Calculate realized volatility from price history"""
+        """Realized log-return volatility, scaled to per-hour units.
+
+        Returns σ_logret · √(samples_per_hour). Multiply by price S to get
+        the absolute (price-units) volatility σ_price that the A-S formulas
+        expect."""
         if len(self.price_history) < 2:
             return self.volatility
-        
+
         returns = []
         for i in range(1, len(self.price_history)):
-            ret = math.log(self.price_history[i] / self.price_history[i-1])
+            ret = math.log(self.price_history[i] / self.price_history[i - 1])
             returns.append(ret)
-        
+
         if len(returns) > 1:
-            self.volatility = statistics.stdev(returns) * math.sqrt(3600)
+            samples_per_hour = 3600.0 / max(UPDATE_FREQUENCY, 1e-6)
+            self.volatility = statistics.stdev(returns) * math.sqrt(samples_per_hour)
             self.volatility = max(self.volatility, 0.001)
-        
+
         return self.volatility
-    
+
     def calculate_reservation_price(self, mid_price: float) -> float:
-        """Calculate reservation price with proper inventory penalty (matches server)"""
-        sigma = self.calculate_volatility()
+        """Canonical Avellaneda-Stoikov reservation price (price units).
+
+        r(t) = s − q · γ · σ_price² · (T − t)
+
+        where σ_price = σ_logret · s, so that everything is dimensionally
+        in dollars. INVENTORY_AVERSION_SCALE=1.0 is canonical; >1 skews
+        quotes harder against inventory without changing spread width."""
+        sigma_logret = self.calculate_volatility()
+        sigma_price = sigma_logret * mid_price
         time_remaining = self.get_time_remaining()
-        
-        # Correct A-S formula: r = m - α * q * σ² * T
-        # Note: Using alpha (inventory penalty), not gamma (risk aversion)
-        inventory_penalty = ALPHA * self.inventory * sigma**2 * time_remaining
-        reservation_price = mid_price - inventory_penalty
-        
-        return reservation_price
+        inventory_penalty = (
+            INVENTORY_AVERSION_SCALE * GAMMA
+            * self.inventory
+            * sigma_price ** 2
+            * time_remaining
+        )
+        return mid_price - inventory_penalty
     
     def get_time_remaining(self) -> float:
         """Get time remaining in current strategy horizon (matches server)"""
@@ -550,31 +567,32 @@ class BingXMarketMaker:
         return max(time_remaining, 0.01)  # Minimum time remaining
     
     def calculate_optimal_spread(self, mid_price: float, ml_signal: float = 0.5) -> float:
-        """Calculate optimal bid-ask spread using Avellaneda-Stoikov + ML adjustment"""
-        sigma = self.calculate_volatility()
+        """Canonical Avellaneda-Stoikov optimal spread (price units).
+
+            spread = γ · σ_price² · (T − t)        ← inventory-risk term
+                   + (2/γ) · ln(1 + γ/k)            ← market-impact / adverse-selection
+
+        σ_price = σ_logret · s, so the whole expression is in dollars.
+        The ML term widens the spread when the model is confident either
+        way (signal far from 0.5); clamped to [2, 20] bps of mid as a
+        safety guard."""
+        sigma_logret = self.calculate_volatility()
+        sigma_price = sigma_logret * mid_price
         time_remaining = self.get_time_remaining()
-        
-        # Base A-S spread
-        risk_term = GAMMA * sigma**2 * time_remaining
-        market_impact_term = (2 / GAMMA) * math.log(1 + GAMMA / K)
-        base_spread = risk_term + market_impact_term
-        
-        # ML adjustment: widen spread if ML predicts high volatility
+
+        risk_term = GAMMA * sigma_price ** 2 * time_remaining
+        market_impact_term = (2.0 / GAMMA) * math.log(1.0 + GAMMA / K)
+        spread = risk_term + market_impact_term
+
         if ML_ENABLED and self.ml_trained:
-            ml_adjustment = 1.0 + (ml_signal - 0.5) * 0.5  # ±25% adjustment
-            base_spread *= ml_adjustment
-        
-        # Server's constraints: minimum spread (wider than before)
-        min_spread_bps = 2.0  # 2 basis points minimum
-        min_spread = (min_spread_bps / 10000) * mid_price
-        spread = max(base_spread * mid_price, min_spread)
-        
-        # Server's maximum spread constraint (CRITICAL!)
-        max_spread_bps = 20.0  # 20 basis points maximum
-        max_spread = (max_spread_bps / 10000) * mid_price
-        spread = min(spread, max_spread)
-        
-        return spread
+            # Widen on conviction (avoid being run over on a strong directional view)
+            ml_adjustment = 1.0 + abs(ml_signal - 0.5) * 0.5
+            spread *= ml_adjustment
+
+        # Safety clamp: keep spread in [2, 20] bps of mid regardless of formula output.
+        min_spread = (2.0 / 10000.0) * mid_price
+        max_spread = (20.0 / 10000.0) * mid_price
+        return max(min_spread, min(spread, max_spread))
     
     def calculate_quote_prices(self, mid_price: float, ml_signal: float = 0.5) -> Tuple[float, float]:
         """Calculate optimal bid and ask prices with ML adjustment"""
