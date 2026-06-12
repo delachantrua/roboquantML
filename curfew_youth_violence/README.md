@@ -45,6 +45,12 @@ effect so you can see the estimators recover it.
 
 ![example event study](docs/example_event_study.png)
 
+It also runs the **curfew-hours falsification** (below): the simulated treatment
+reduces *only* juvenile, curfew-hour violence, and the pipeline correctly finds
+a strong effect in curfew hours and a null in non-curfew hours.
+
+![example falsification](docs/example_falsification.png)
+
 ## Live data (real NIBRS / FBI CDE)
 
 The outcome data come from the **FBI Crime Data Explorer (CDE)** API, the modern
@@ -65,6 +71,28 @@ gateway to NIBRS/SRS (`https://cde.ucr.cjis.gov/`).
 
 If no API key is set, `run.py` automatically falls back to simulation mode.
 
+## Juvenile outcome & curfew-hours falsification (incident-level)
+
+Two outcomes need data the *summarized* CDE endpoint can't provide — victim age
+and incident hour — so they run off **incident-level NIBRS extracts**:
+
+- **Genuine juvenile outcome (victim-age join).** `nibrs_incidents.py` keeps only
+  victims under 18 (`juvenile_max_age`), giving true juvenile victimization
+  counts instead of total offenses scaled by an assumed share.
+- **Non-curfew-hours falsification.** A curfew should suppress violence *during
+  curfew hours* (e.g. 22:00–06:00), not during the day. The pipeline estimates
+  the effect separately on curfew-hour and non-curfew-hour juvenile
+  victimizations. A credible result is **negative in curfew hours and null in
+  non-curfew hours**; a comparable non-curfew effect signals confounding (a
+  general decline) rather than a curfew effect. `_falsification_verdict` encodes
+  this as a pass/fail check, and the validation test confirms it recovers the
+  right pattern on simulated incidents.
+
+Provide an extract via `incident_file` in `config.yaml` (one row per
+victim-incident: ORI, incident timestamp, victim age, offense). Source these
+from the FBI CDE bulk downloads or NACJD/ICPSR NIBRS files. Without an extract,
+the live pipeline falls back to the summarized total-offense outcome.
+
 ## The curfew-policy panel (hand-collected keystone)
 
 `data/curfew_policies.csv` maps each city to the **effective month** of its
@@ -82,11 +110,11 @@ verified, notes`. `policy_type ∈ {adopt, tighten, loosen, repeal}`; `adopt`/
 ## Known limitations (read before reporting numbers)
 
 - **Juvenile-specific counts.** The CDE *summarized* endpoint returns *total*
-  offense counts per agency-month, not victim-age-restricted counts. True
-  juvenile victimization needs the NIBRS victim-demographic tables. As a
-  first pass we use total violent offenses and expose a documented
-  `juvenile_share` scaling assumption — **do not** report these as juvenile-only
-  without the victim-age join.
+  offense counts per agency-month. The genuine juvenile (age < 18) outcome and
+  the falsification test therefore require **incident-level NIBRS extracts**
+  (`incident_file`); see the section above. The summarized path remains
+  available with a documented `juvenile_share` scaling assumption — but prefer
+  the incident-level victim-age join when you have the data.
 - **Curfew dates are hand-collected.** Verify every row before publishing.
 - **Threats to validity** to check (see your research notes): displacement of
   violence to non-curfew hours, time-varying enforcement intensity, and curfews
@@ -103,14 +131,17 @@ curfew_youth_violence/
 ├── config.yaml                  # live-run settings
 ├── data/curfew_policies.csv     # curated curfew dates (verify before use)
 ├── src/curfew/
-│   ├── nibrs.py                 # FBI CDE API client
+│   ├── nibrs.py                 # FBI CDE API client (summarized counts)
+│   ├── nibrs_incidents.py       # incident-level: victim-age join + curfew hours
 │   ├── policies.py              # load/validate the curfew panel
-│   ├── panel.py                 # build balanced city×month panel + cohorts
-│   ├── simulate.py              # staggered DGP with a KNOWN effect
-│   ├── plots.py                 # event-study figure
-│   ├── pipeline.py              # orchestration
+│   ├── panel.py                 # build balanced city×month panels + cohorts
+│   ├── simulate.py              # staggered DGP (panel + incident-level) w/ KNOWN effect
+│   ├── plots.py                 # event-study & falsification figures
+│   ├── pipeline.py              # orchestration (summarized + incident-level)
 │   └── estimators/              # CS, Sun–Abraham, TWFE
-└── tests/test_estimators.py     # validation: recover the known ATT
+└── tests/
+    ├── test_estimators.py       # validation: recover the known ATT
+    └── test_falsification.py    # victim-age join + curfew-hours falsification
 ```
 
 ## References

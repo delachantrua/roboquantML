@@ -24,6 +24,18 @@ donor_oris: []
 # unavailable (documented assumption; null = use total counts). e.g. 0.15
 juvenile_share: null
 
+# --- Incident-level path (genuine juvenile outcome + falsification) ----------
+# Point this at a NIBRS incident extract (CSV/Parquet) with one row per victim-
+# incident carrying an ORI, an incident timestamp, and victim age. When set, the
+# pipeline builds a TRUE juvenile (age < 18) outcome and runs the curfew-hours
+# vs. non-curfew-hours falsification test. Leave null to use summarized counts.
+incident_file: null            # e.g. data/raw/nibrs_incidents.csv
+
+# Nightly curfew window [start, end) in 24h local time (overnight is fine).
+curfew_start: 22
+curfew_end: 6
+juvenile_max_age: 17           # victims at or below this age count as juvenile
+
 # Estimation settings.
 comparison: notyettreated      # or 'nevertreated'
 min_event_time: -12            # months of leads (pre-trend window)

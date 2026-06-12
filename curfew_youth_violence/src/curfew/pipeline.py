@@ -25,10 +25,11 @@ from .estimators import (
     estimate_twfe_event_study,
 )
 from .nibrs import DEFAULT_OFFENSES, FBICDEClient, fetch_city_panel
-from .panel import build_panel_from_counts
-from .plots import plot_event_study
+from .nibrs_incidents import load_incident_extract
+from .panel import assemble_panel, build_incident_panels, build_panel_from_counts
+from .plots import plot_event_study, plot_falsification
 from .policies import load_policies
-from .simulate import simulate_panel
+from .simulate import simulate_incidents, simulate_panel
 
 
 def _estimate_all(panel, min_e, max_e, n_boot, comparison, seed):
@@ -60,6 +61,103 @@ def run_simulation(outdir: Path, n_boot: int = 1000, min_e: int = -12,
         "pretrend_pvalue": cs.pretrend_pvalue,
     })
     return cs, sa, twfe, sim
+
+
+def _falsification_verdict(cs_curfew, cs_noncurfew) -> dict:
+    """Summarise the curfew-hours vs. non-curfew-hours comparison.
+
+    The design predicts a (negative) effect concentrated in curfew hours. We
+    flag a clean falsification when the curfew-hour effect is significant and the
+    non-curfew-hour effect is both small relative to it and not significant.
+    """
+    att_c, se_c = cs_curfew.overall_att, cs_curfew.overall_se
+    att_n, se_n = cs_noncurfew.overall_att, cs_noncurfew.overall_se
+    z_c = att_c / se_c if se_c else float("nan")
+    z_n = att_n / se_n if se_n else float("nan")
+    ratio = abs(att_n) / abs(att_c) if att_c else float("nan")
+    clean = (
+        att_c < 0 and abs(z_c) > 1.96            # real curfew-hour effect
+        and abs(z_n) < 1.96                       # no significant non-curfew effect
+        and ratio < 0.3                           # and it's small in magnitude
+    )
+    return {
+        "curfew_overall_att": att_c, "curfew_overall_se": se_c, "curfew_z": z_c,
+        "noncurfew_overall_att": att_n, "noncurfew_overall_se": se_n, "noncurfew_z": z_n,
+        "noncurfew_to_curfew_ratio": ratio,
+        "clean_falsification": bool(clean),
+    }
+
+
+def run_falsification_simulation(outdir: Path, n_boot: int = 600, min_e: int = -12,
+                                 max_e: int = 24, comparison: str = "notyettreated",
+                                 seed: int = 21):
+    """Simulate incident-level data and run the curfew-hours falsification."""
+    sim = simulate_incidents(seed=seed)
+    from .nibrs_incidents import aggregate_incidents
+
+    strata = aggregate_incidents(
+        sim.incidents, curfew_start=sim.curfew_start, curfew_end=sim.curfew_end,
+    )
+    panel_c = assemble_panel(strata["juvenile_curfew"], sim.cohorts)
+    panel_n = assemble_panel(strata["juvenile_noncurfew"], sim.cohorts)
+
+    cs_c = estimate_att_gt(panel_c, comparison=comparison, min_event_time=min_e,
+                           max_event_time=max_e, n_boot=n_boot, seed=seed)
+    cs_n = estimate_att_gt(panel_n, comparison=comparison, min_event_time=min_e,
+                           max_event_time=max_e, n_boot=n_boot, seed=seed)
+
+    plot_falsification(cs_c.event_study, cs_n.event_study,
+                       outdir / "falsification.png", truth=sim.true_event_study)
+    verdict = _falsification_verdict(cs_c, cs_n)
+    verdict.update({"mode": "simulation",
+                    "true_curfew_overall_att": sim.true_overall_att})
+    (outdir / "falsification.json").write_text(json.dumps(verdict, indent=2, default=float))
+    cs_c.event_study.to_csv(outdir / "falsification_curfew_es.csv", index=False)
+    cs_n.event_study.to_csv(outdir / "falsification_noncurfew_es.csv", index=False)
+    return cs_c, cs_n, verdict, sim
+
+
+def run_falsification_live(config: dict, outdir: Path):
+    """Live incident-level path: juvenile victim-age join + curfew falsification."""
+    policies = load_policies(config["policy_file"])
+    incidents = load_incident_extract(
+        config["incident_file"],
+        offenses=tuple(config["offenses"]) if config.get("offenses") else None,
+    )
+    panels = build_incident_panels(
+        incidents, policies,
+        curfew_start=config.get("curfew_start", 22),
+        curfew_end=config.get("curfew_end", 6),
+        juvenile_max_age=config.get("juvenile_max_age", 17),
+    )
+    min_e = config.get("min_event_time", -12)
+    max_e = config.get("max_event_time", 24)
+    n_boot = config.get("n_boot", 1000)
+    comparison = config.get("comparison", "notyettreated")
+    seed = config.get("seed", 7)
+
+    cs_c = estimate_att_gt(panels["juvenile_curfew"], comparison=comparison,
+                           min_event_time=min_e, max_event_time=max_e,
+                           n_boot=n_boot, seed=seed)
+    cs_n = estimate_att_gt(panels["juvenile_noncurfew"], comparison=comparison,
+                           min_event_time=min_e, max_event_time=max_e,
+                           n_boot=n_boot, seed=seed)
+    cs_all = estimate_att_gt(panels["juvenile_all"], comparison=comparison,
+                             min_event_time=min_e, max_event_time=max_e,
+                             n_boot=n_boot, seed=seed)
+
+    plot_falsification(cs_c.event_study, cs_n.event_study, outdir / "falsification.png")
+    plot_event_study(cs_all.event_study, outdir / "event_study_juvenile.png",
+                     title="Effect of curfew on juvenile victimization (all hours)")
+    verdict = _falsification_verdict(cs_c, cs_n)
+    verdict.update({"mode": "live",
+                    "juvenile_all_overall_att": cs_all.overall_att,
+                    "juvenile_all_overall_se": cs_all.overall_se,
+                    "n_agencies": int(panels["juvenile_curfew"]["unit"].nunique())})
+    (outdir / "falsification.json").write_text(json.dumps(verdict, indent=2, default=float))
+    for name, cs in [("curfew", cs_c), ("noncurfew", cs_n), ("juvenile_all", cs_all)]:
+        cs.event_study.to_csv(outdir / f"falsification_{name}_es.csv", index=False)
+    return cs_c, cs_n, cs_all, verdict
 
 
 def run_live(config: dict, outdir: Path):

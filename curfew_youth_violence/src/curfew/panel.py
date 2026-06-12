@@ -88,6 +88,60 @@ def build_panel_from_counts(
     return panel.sort_values(["unit", "period"]).reset_index(drop=True)
 
 
+def assemble_panel(
+    counts: pd.DataFrame,
+    cohorts: dict,
+    require_balanced: bool = True,
+) -> pd.DataFrame:
+    """Attach cohorts to a single-outcome count frame -> estimator panel.
+
+    ``counts`` is long [unit, period(int), count]; ``cohorts`` maps unit -> first
+    treated period (int) or ``NEVER_TREATED``. Used by the incident-level
+    (juvenile / falsification) path where periods are already integer indices.
+    """
+    df = counts.rename(columns={"count": "y"}).copy()
+    df["cohort"] = df["unit"].map(cohorts).fillna(NEVER_TREATED).astype(int)
+    panel = df[["unit", "period", "cohort", "y"]]
+    if require_balanced:
+        panel = _balance(panel)
+    return panel.sort_values(["unit", "period"]).reset_index(drop=True)
+
+
+def build_incident_panels(
+    incidents: pd.DataFrame,
+    policies: pd.DataFrame,
+    curfew_start: int = 22,
+    curfew_end: int = 6,
+    juvenile_max_age: int = 17,
+) -> dict[str, pd.DataFrame]:
+    """From incident records + policy panel, build one estimator panel per stratum.
+
+    Returns a dict {outcome_name: panel[unit, period, cohort, y]} for the four
+    strata produced by ``aggregate_incidents`` (juvenile_curfew is the primary
+    outcome; juvenile_noncurfew is the falsification outcome). Periods (YYYY-MM)
+    are converted to a dense integer index so the estimators' g-1 arithmetic
+    works, and cohorts are mapped from the curfew effective months.
+    """
+    from .nibrs_incidents import aggregate_incidents
+
+    strata = aggregate_incidents(
+        incidents, curfew_start=curfew_start, curfew_end=curfew_end,
+        juvenile_max_age=juvenile_max_age,
+    )
+    all_periods = sorted(incidents["period"].unique())
+    lut = {p: i for i, p in enumerate(all_periods)}
+    cohort_lut = _build_cohort_lut(policies, lut)
+
+    panels = {}
+    for name, c in strata.items():
+        c = c.copy()
+        c["period"] = c["period"].map(lut)
+        c["cohort"] = c["unit"].map(cohort_lut).fillna(NEVER_TREATED).astype(int)
+        panel = c.rename(columns={"count": "y"})[["unit", "period", "cohort", "y"]]
+        panels[name] = _balance(panel).sort_values(["unit", "period"]).reset_index(drop=True)
+    return panels
+
+
 def _build_cohort_lut(policies: pd.DataFrame, period_lut: dict) -> dict:
     """Map each treated ORI to the integer period of its first onset event."""
     onset = policies[policies["policy_type"].isin(["adopt", "tighten"])].copy()
