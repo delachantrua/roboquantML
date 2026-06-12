@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+outputs/
+data/raw/
+data/population.csv
+.env
+.DS_Store

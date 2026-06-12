@@ -1,0 +1,7 @@
+city,state,ori,policy_type,effective_month,source_url,verified,notes
+Baltimore,MD,,tighten,2014-08,https://en.wikipedia.org/wiki/Baltimore_youth_curfew,False,"2014 ordinance: among the strictest US youth curfews; earlier hours for younger minors. Confirm exact effective month and ORI (MD0240000) before use."
+Chicago,IL,,tighten,2022-05,https://www.chicago.gov/city/en/depts/mayor/press_room/press_releases/2022/may/MillenniumParkCurfew.html,False,"May 2022 unaccompanied-minor curfew tightening after downtown shooting. Confirm ORI (ILCPD0000) and whether change is citywide vs Millennium Park only."
+Philadelphia,PA,,tighten,2022-07,https://www.phila.gov/2022-07-13-philadelphia-strengthens-curfew-for-minors/,False,"July 2022 curfew strengthening to 10pm for minors after gun-violence surge. Confirm ORI (PAPEP0000) and effective month."
+Washington,DC,,tighten,2023-07,https://mpdc.dc.gov/page/juvenile-curfew,False,"2023 expanded curfew-enforcement zones. DC also runs seasonal curfew-hour shifts useful for within-city RD. Confirm ORI (DCMPD0000)."
+Hartford,CT,,adopt,2019-06,https://www.courant.com/community/hartford/,False,"Placeholder example row -- replace with a verified ordinance date and source, or delete."
+Memphis,TN,,tighten,2016-07,https://www.memphistn.gov/,False,"Placeholder example row -- replace with a verified ordinance date and source, or delete."

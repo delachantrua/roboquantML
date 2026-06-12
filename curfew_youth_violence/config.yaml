@@ -1,0 +1,32 @@
+# Configuration for live (FBI CDE) runs of the curfews & youth-violence study.
+# Simulation mode ignores this file.
+
+policy_file: data/curfew_policies.csv
+
+# Optional: per-100k rate needs a population file [ori, year, population].
+# population_file: data/population.csv
+
+# Component offenses summed into the violent-crime outcome (CDE slugs).
+offenses:
+  - aggravated-assault
+  - robbery
+  - homicide
+
+# Observation window (CDE MM-YYYY convention).
+from_month: "01-2010"
+to_month: "12-2022"
+
+# Never-treated / donor comparison agencies (ORIs) with NO curfew change in the
+# window. Strongly recommended so 'notyettreated' has a clean control pool.
+donor_oris: []
+
+# Approximate juvenile share of violent victimization when victim-age tables are
+# unavailable (documented assumption; null = use total counts). e.g. 0.15
+juvenile_share: null
+
+# Estimation settings.
+comparison: notyettreated      # or 'nevertreated'
+min_event_time: -12            # months of leads (pre-trend window)
+max_event_time: 24             # months of lags (dynamic effects)
+n_boot: 1000                   # cluster bootstrap replications
+seed: 7
