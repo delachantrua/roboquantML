@@ -1,0 +1,57 @@
+# REAL-DATA configuration: FBI CDE monthly offense counts, 13 large-city
+# agencies, 2012-2024. Uses the cached extract in data/raw/ (committed for
+# reproducibility; re-fetch by removing counts_file and setting FBI_CDE_API_KEY).
+
+policy_file: data/curfew_policies.csv
+counts_file: data/raw/cde_counts_2010_2024.csv
+
+# Analysis window. Starting 2012 gives the 2014 Baltimore cohort 31 pre months
+# while avoiding Minneapolis's missing 2010-2012 (Minneapolis dropped anyway).
+window_from: "2012-01"
+window_to: "2024-12"
+
+# Exclusions.
+# Data quality (>6-month reporting gaps in-window):
+#   OR0260200  Portland PD    (Apr-Dec 2015 gap)
+#   MN0271100  Minneapolis PD (most of 2010-2012 missing)
+# Policy contamination (cannot serve as never-treated donors; see
+# data/curfew_policies.csv notes, verified by web research 2026-06):
+#   NC0600100  Charlotte-Mecklenburg (curfew tightened ~2011-07, BEFORE window
+#              start -> would silently pass as never-treated; exclude)
+#   TX2270100  Austin (curfew REPEALED 2017-09 -- loosening mid-window)
+#   OHCOP0000  Columbus (Short North zone curfew 2023-05)
+#   WIMPD0000  Milwaukee (citywide curfew-enforcement surge 2022-06)
+exclude_oris:
+  - OR0260200
+  - MN0271100
+  - NC0600100
+  - TX2270100
+  - OHCOP0000
+  - WIMPD0000
+
+# Main panel: treated = Baltimore (2014-08), Chicago (2022-06),
+# Philadelphia (2022-07), DC (2023-09, zone enforcement pilot);
+# donors = Boston, Seattle, Denver, Nashville, Louisville.
+
+# Short non-reporting runs (2021 SRS->NIBRS transition: Baltimore, Chicago,
+# DC incl. partial-reporting months; Philadelphia 2019-07) are flagged when a
+# month falls below 20% of the agency median and linearly interpolated, max
+# run length 7. With min_event_time=-11 below, NO interpolated month enters
+# any treated cohort's own event-study cells (verified); one DC interpolated
+# month (2021-07) appears once as a comparison observation.
+interpolate_gaps: 7
+
+# Outcome: log(monthly violent offenses) -> ATT in log points (~% changes),
+# comparable across cities of very different sizes.
+log_outcome: true
+
+offenses: [aggravated-assault, robbery, homicide]
+
+comparison: notyettreated
+# -11 (not -12) so Chicago's event window starts 2021-07 = its NIBRS start,
+# keeping every in-window cell inside a single reporting regime (Chicago's
+# SRS->NIBRS transition is a ~3x level break in aggravated assault).
+min_event_time: -11
+max_event_time: 24
+n_boot: 1000
+seed: 7

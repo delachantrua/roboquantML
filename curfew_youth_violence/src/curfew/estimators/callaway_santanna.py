@@ -206,6 +206,13 @@ def estimate_att_gt(
         idx = rng.integers(0, n_units, size=n_units)
         Yb, Gb = Y[idx], G[idx]
         pb = _att_gt_pointwise(Yb, periods, Gb, comparison)
+        if pb.empty:
+            # Resample lost every treated cohort (possible when cohorts have
+            # very few units). Contributes NaN to all cells.
+            boot_att_gt.append(np.full(len(point), np.nan))
+            boot_es.append(np.full(len(es_event_times), np.nan))
+            boot_overall.append(np.nan)
+            continue
         # Align by (cohort, period); missing cells -> NaN (dropped in std).
         merged = point[["cohort", "period"]].merge(
             pb[["cohort", "period", "att"]], on=["cohort", "period"], how="left"
@@ -240,7 +247,8 @@ def estimate_att_gt(
     # max-t statistic across event times (Callaway-Sant'Anna simultaneous band).
     with np.errstate(invalid="ignore", divide="ignore"):
         tstats = np.abs((boot_es - es_point["att"].to_numpy()) / es_se)
-    max_t = np.nanmax(tstats, axis=1)
+    valid = ~np.isnan(tstats).all(axis=1)  # drop resamples with no treated units
+    max_t = np.nanmax(tstats[valid], axis=1)
     crit = np.nanquantile(max_t, 1 - alpha)
     es["band_low"] = es["att"] - crit * es_se
     es["band_high"] = es["att"] + crit * es_se
@@ -266,27 +274,31 @@ def estimate_att_gt(
 
 
 def _pretrend_test(es_att: np.ndarray, event_times: np.ndarray, boot_es: np.ndarray) -> float:
-    """Joint Wald test that the pre-period event-study path is flat at zero.
+    """Sup-t test that the pre-period event-study path is flat at zero.
 
-    Operates on the aggregated event-study coefficients (e < 0), using their
-    bootstrap covariance. Returns a p-value; small values flag violated
-    parallel trends / anticipation.
+    Compares the largest pre-period |t| statistic against its bootstrap null
+    distribution (the same construction as the sup-t uniform band). This is
+    numerically robust where a joint Wald test is not: with highly correlated
+    pre-period coefficients the bootstrap covariance is near-singular and the
+    Wald statistic explodes, producing spurious p ~ 0 even when every pre
+    coefficient is individually tiny.
+
+    Returns a p-value; small values flag violated parallel trends or
+    anticipation.
     """
     pre = np.asarray(event_times) < 0
     if pre.sum() == 0:
         return np.nan
     theta = np.asarray(es_att)[pre]
     boot_pre = boot_es[:, pre]
-    # Drop bootstrap rows with any NaN in the pre coefficients.
-    ok = ~np.isnan(boot_pre).any(axis=1)
-    boot_pre = boot_pre[ok]
-    if boot_pre.shape[0] < boot_pre.shape[1] + 2:
+    se = np.nanstd(boot_pre, axis=0, ddof=1)
+    se = np.where(se > 0, se, np.nan)
+    obs = np.nanmax(np.abs(theta / se))
+    # Null distribution: bootstrap deviations around the point estimates.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tstats = np.abs((boot_pre - theta) / se)
+    ok = ~np.isnan(tstats).all(axis=1)
+    if ok.sum() < 50:
         return np.nan
-    cov = np.cov(boot_pre, rowvar=False)
-    try:
-        wald = float(theta @ np.linalg.solve(cov, theta))
-    except np.linalg.LinAlgError:
-        wald = float(theta @ np.linalg.pinv(cov) @ theta)
-    from scipy.stats import chi2
-
-    return float(chi2.sf(wald, df=len(theta)))
+    boot_max = np.nanmax(tstats[ok], axis=1)
+    return float(np.mean(boot_max >= obs))

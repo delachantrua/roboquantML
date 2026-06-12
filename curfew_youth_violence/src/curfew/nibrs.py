@@ -110,16 +110,32 @@ def _extract_actuals(data: dict) -> dict:
     """
     if not isinstance(data, dict):
         raise ValueError("Unexpected CDE payload (not an object).")
-    # Shape A: {"offenses": {"actuals": {"<offense>": {"MM-YYYY": n}}}}
+    # Shape A (current, verified 2026-06): {"offenses": {"actuals":
+    #   {"<Agency Name> Offenses": {"MM-YYYY": n},
+    #    "<Agency Name> Clearances": {...}}}}
+    # We must select the agency *Offenses* series explicitly -- grabbing the
+    # first dict could silently return Clearances.
     off = data.get("offenses") or data.get("actuals")
     if isinstance(off, dict):
         actuals = off.get("actuals", off)
         if isinstance(actuals, dict):
-            # may be nested by series name -> dict of months
-            for v in actuals.values():
-                if isinstance(v, dict):
-                    return v
-            return actuals
+            offense_series = {
+                k: v for k, v in actuals.items()
+                if isinstance(v, dict) and k.endswith(" Offenses")
+            }
+            if len(offense_series) == 1:
+                return next(iter(offense_series.values()))
+            if len(offense_series) > 1:
+                raise ValueError(
+                    f"Multiple 'Offenses' series in CDE response: "
+                    f"{sorted(offense_series)} -- disambiguate in _extract_actuals."
+                )
+            # Fallback: a single unlabelled dict of months.
+            dicts = [v for v in actuals.values() if isinstance(v, dict)]
+            if len(dicts) == 1:
+                return dicts[0]
+            if not dicts and actuals:
+                return actuals
     # Shape B: {"results": [{"data_year":..., "month":..., "value":...}]}
     if isinstance(data.get("results"), list):
         out = {}
