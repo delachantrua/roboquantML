@@ -34,6 +34,8 @@ def build_panel_from_counts(
     population: pd.DataFrame | None = None,
     juvenile_share: float | None = None,
     require_balanced: bool = True,
+    interpolate_gaps: int = 0,
+    log_outcome: bool = False,
 ) -> pd.DataFrame:
     """Assemble the analysis panel.
 
@@ -49,11 +51,25 @@ def build_panel_from_counts(
         Documented assumption, not a substitute for NIBRS victim-age tables.
     require_balanced : drop units not observed in every period (estimators need
         a balanced panel for the long-difference comparisons).
+    interpolate_gaps : maximum length (months) of consecutive missing/zero runs
+        to fill by linear interpolation within an agency series. Real CDE data
+        has short reporting gaps (e.g. the 2021 SRS->NIBRS transition); a "0"
+        in those runs is non-reporting, not zero crime. Gaps longer than this
+        are left missing (the agency is then dropped by balancing). 0 disables.
+    log_outcome : use log(violent) as the outcome -> ATT in log points
+        (~percent changes), making effects comparable across cities of very
+        different sizes. Requires strictly positive counts after interpolation.
     """
     df = counts.copy()
-    # Sum the component offenses into a single violent-crime outcome per ori-month.
-    grp = df.groupby(["ori", "period"], as_index=False)["count"].sum()
+    # Treat blank/NaN counts as missing, sum offenses into violent per ori-month.
+    df["count"] = pd.to_numeric(df["count"], errors="coerce")
+    grp = df.groupby(["ori", "period"], as_index=False)["count"].agg(
+        lambda s: s.sum(min_count=len(s))  # NaN if ANY component is missing
+    )
     grp = grp.rename(columns={"count": "violent"})
+
+    if interpolate_gaps:
+        grp = _interpolate_short_gaps(grp, max_gap=interpolate_gaps)
 
     # Optional population -> per-100k rate.
     if population is not None:
@@ -71,6 +87,26 @@ def build_panel_from_counts(
             raise ValueError("juvenile_share must be in (0, 1].")
         grp["y"] = grp["y"] * juvenile_share
 
+    if log_outcome:
+        if (grp["y"].dropna() <= 0).any():
+            bad = grp.loc[grp["y"] <= 0, "ori"].unique().tolist()
+            raise ValueError(
+                f"log_outcome requires positive counts; non-positive values for "
+                f"{bad}. Increase interpolate_gaps or drop those agencies."
+            )
+        grp["y"] = np.log(grp["y"])
+
+    # Drop agencies with unresolved missing months (gaps longer than the
+    # interpolation cap) BEFORE balancing so the warning names them.
+    has_nan = grp.groupby("ori")["y"].apply(lambda s: s.isna().any())
+    bad_oris = has_nan[has_nan].index.tolist()
+    if bad_oris:
+        warnings.warn(
+            f"Dropping {len(bad_oris)} agencies with unresolved reporting gaps "
+            f"(longer than interpolate_gaps): {bad_oris}"
+        )
+        grp = grp[~grp["ori"].isin(bad_oris)]
+
     # Integer period index.
     grp["period_idx"], lut = _month_to_index(grp["period"])
 
@@ -78,14 +114,54 @@ def build_panel_from_counts(
     cohort_lut = _build_cohort_lut(policies, lut)
     grp["cohort"] = grp["ori"].map(cohort_lut).fillna(NEVER_TREATED).astype(int)
 
-    panel = grp.rename(columns={"ori": "unit", "period_idx": "period"})[
-        ["unit", "period", "cohort", "y", "violent"]
-    ]
+    panel = grp.drop(columns=["period"]).rename(
+        columns={"ori": "unit", "period_idx": "period"}
+    )[["unit", "period", "cohort", "y", "violent"]]
 
     if require_balanced:
         panel = _balance(panel)
 
     return panel.sort_values(["unit", "period"]).reset_index(drop=True)
+
+
+def _interpolate_short_gaps(
+    grp: pd.DataFrame, max_gap: int, low_count_frac: float = 0.2
+) -> pd.DataFrame:
+    """Linearly interpolate short runs of non-reporting months within an agency.
+
+    Big-city monthly *violent* totals (assault+robbery+homicide) are never
+    genuinely near zero, so a month below ``low_count_frac`` x the agency's
+    median (computed over plausible months) is treated as non-reporting --
+    this catches both hard zeros AND partial-reporting months (e.g. Chicago
+    June 2021 = 1 offense during the SRS->NIBRS transition). Runs longer than
+    ``max_gap`` are left missing. Interpolated cells are flagged in the
+    'interpolated' column.
+    """
+    out = []
+    for ori, sub in grp.groupby("ori"):
+        sub = sub.sort_values("period").copy()
+        y = sub["violent"].astype(float)
+        med = y[y > 0].median()
+        y[y < low_count_frac * med] = np.nan
+        filled = y.interpolate(method="linear", limit=max_gap, limit_area="inside")
+        # Identify runs longer than max_gap and revert them to NaN.
+        isna = y.isna()
+        run_id = (isna != isna.shift()).cumsum()
+        run_len = isna.groupby(run_id).transform("sum")
+        too_long = isna & (run_len > max_gap)
+        filled[too_long] = np.nan
+        sub["interpolated"] = isna & filled.notna()
+        sub["violent"] = filled
+        out.append(sub)
+    res = pd.concat(out, ignore_index=True)
+    n_interp = int(res["interpolated"].sum())
+    if n_interp:
+        per_agency = res[res["interpolated"]].groupby("ori").size().to_dict()
+        warnings.warn(
+            f"Interpolated {n_interp} non-reporting agency-months "
+            f"(zero/missing runs <= {max_gap}): {per_agency}"
+        )
+    return res
 
 
 def assemble_panel(

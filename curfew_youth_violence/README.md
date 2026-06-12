@@ -51,6 +51,59 @@ a strong effect in curfew hours and a null in non-curfew hours.
 
 ![example falsification](docs/example_falsification.png)
 
+## Real-data results (FBI CDE, 2012–2024)
+
+`config_real.yaml` runs the analysis on **real FBI Crime Data Explorer monthly
+offense counts** (cached in `data/raw/cde_counts_2010_2024.csv` for
+reproducibility):
+
+```bash
+python run.py --config config_real.yaml --outdir outputs_real
+```
+
+**Design.** 4 treated cities with web-verified curfew events — Baltimore
+(ordinance, 2014-08), Chicago (citywide ordinance, first full month 2022-06),
+Philadelphia (ordinance, 2022-07), Washington DC (zone enforcement pilot,
+2023-09) — against 5 clean never-treated donors (Boston, Seattle, Denver,
+Nashville, Louisville). Austin (curfew *repealed* 2017), Charlotte (tightened
+2011), Columbus (zone curfew 2023) and Milwaukee (enforcement surge 2022) were
+identified as contaminated donors and excluded; Portland and Minneapolis were
+excluded for long reporting gaps. Outcome: log monthly violent offenses
+(aggravated assault + robbery + homicide). Non-reporting months around the 2021
+SRS→NIBRS transition are detected (< 20% of agency median) and interpolated;
+the event window starts at e = −11 so no cell straddles Chicago's ~3× SRS→NIBRS
+level break.
+
+![real-data event study](docs/real_event_study.png)
+
+**Headline result: a precise null.** Overall ATT ≈ **+0.05 log points
+(se ≈ 0.11)**; pre-trend sup-t test p ≈ 0.77 (parallel trends not rejected).
+Consistent with the older curfew literature (Adams 2003; Kline 2012): no
+detectable effect of curfew adoption/tightening on **total** violent crime.
+
+**Robustness** (overall ATT, log points; cluster-bootstrap se; sup-t pre-trend p):
+
+| Specification | ATT | se | pre-trend p |
+|---|---|---|---|
+| Main: 4 treated, not-yet-treated comparison | +0.051 | 0.106 | 0.765 |
+| Excluding DC (3 ordinance changes only) | +0.097 | 0.100 | 0.098 |
+| Never-treated comparison group | +0.062 | 0.094 | 0.608 |
+| Baltimore cohort only | +0.204 | 0.092 | **0.000** |
+| Chicago/Philadelphia/DC (2022–23) cohorts only | −0.014 | 0.098 | 0.288 |
+
+The 2022–23 cohorts are a clean null. Baltimore *alone* shows a positive
+coefficient — but its pre-trend test **rejects**, and its post window contains
+the April 2015 unrest and subsequent homicide surge: that coefficient reflects
+confounding by a co-occurring shock, not a curfew effect, and Baltimore fails
+its own identification check. The pooled estimate is a null.
+
+**Interpretation caution.** The outcome is *total* (all-age, all-hours) violent
+crime — a low-power proxy. A genuine effect on juvenile, curfew-hours violence
+could be diluted beyond detection here; the incident-level path (victim-age
+join + curfew-hours falsification) is the right test and awaits NIBRS incident
+extracts. Also: only 4 treated units (1 per cohort), so cluster-bootstrap
+inference is fragile — placebo/permutation inference is the natural upgrade.
+
 ## Live data (real NIBRS / FBI CDE)
 
 The outcome data come from the **FBI Crime Data Explorer (CDE)** API, the modern

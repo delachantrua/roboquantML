@@ -1,0 +1,10 @@
+{
+  "mode": "live",
+  "comparison": "notyettreated",
+  "n_boot": 1000,
+  "overall_att": 0.050973475905023845,
+  "overall_se": 0.10609231247335801,
+  "pretrend_pvalue": 0.7645875251509054,
+  "n_agencies": 9,
+  "n_periods": 156
+}

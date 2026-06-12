@@ -2,7 +2,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 outputs/
-data/raw/
+outputs_real/
+# Cached public CDE extracts ARE committed for reproducibility; ignore only
+# bulk incident extracts, which can be large.
+data/raw/*incidents*
 data/population.csv
 .env
 .DS_Store

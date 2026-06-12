@@ -161,29 +161,41 @@ def run_falsification_live(config: dict, outdir: Path):
 
 
 def run_live(config: dict, outdir: Path):
-    """Live mode: fetch CDE data for cities in the policy panel and estimate."""
+    """Live mode: CDE data (cached file or API fetch) -> panel -> estimates."""
     policies = load_policies(config["policy_file"])
-    client = FBICDEClient()
 
-    # Resolve the set of agencies to pull: those with an ORI in the policy panel
-    # (treated) plus any explicit donor/never-treated ORIs in the config.
-    treated_oris = [o for o in policies["ori"].unique() if str(o).strip()]
-    donor_oris = config.get("donor_oris", [])
-    oris = list(dict.fromkeys(treated_oris + donor_oris))
-    if not oris:
-        raise RuntimeError(
-            "No ORIs to fetch. Fill the 'ori' column in curfew_policies.csv and/or "
-            "add 'donor_oris' (never-treated comparison cities) to config.yaml."
+    if config.get("counts_file"):
+        # Cached counts (e.g. data/raw/cde_counts_*.csv) -- reproducible runs
+        # without hitting the API.
+        counts = pd.read_csv(config["counts_file"])
+    else:
+        client = FBICDEClient()
+        # Resolve the set of agencies to pull: those with an ORI in the policy
+        # panel (treated) plus any explicit donor/never-treated ORIs.
+        treated_oris = [o for o in policies["ori"].unique() if str(o).strip()]
+        donor_oris = config.get("donor_oris", [])
+        oris = list(dict.fromkeys(treated_oris + donor_oris))
+        if not oris:
+            raise RuntimeError(
+                "No ORIs to fetch. Fill the 'ori' column in curfew_policies.csv "
+                "and/or add 'donor_oris' to config.yaml."
+            )
+        agencies = [{"ori": o, "name": o} for o in oris]
+        counts = fetch_city_panel(
+            client, agencies,
+            offenses=config.get("offenses", DEFAULT_OFFENSES),
+            from_month=config.get("from_month", "01-2010"),
+            to_month=config.get("to_month", "12-2022"),
         )
-    agencies = [{"ori": o, "name": o} for o in oris]
+        counts.to_csv(outdir / "raw_counts.csv", index=False)
 
-    counts = fetch_city_panel(
-        client, agencies,
-        offenses=config.get("offenses", DEFAULT_OFFENSES),
-        from_month=config.get("from_month", "01-2010"),
-        to_month=config.get("to_month", "12-2022"),
-    )
-    counts.to_csv(outdir / "raw_counts.csv", index=False)
+    # Optional window / agency filters applied to whatever source we used.
+    if config.get("window_from"):
+        counts = counts[counts["period"] >= config["window_from"]]
+    if config.get("window_to"):
+        counts = counts[counts["period"] <= config["window_to"]]
+    for ori in config.get("exclude_oris", []):
+        counts = counts[counts["ori"] != ori]
 
     population = None
     if config.get("population_file"):
@@ -192,6 +204,8 @@ def run_live(config: dict, outdir: Path):
     panel = build_panel_from_counts(
         counts, policies, population=population,
         juvenile_share=config.get("juvenile_share"),
+        interpolate_gaps=config.get("interpolate_gaps", 0),
+        log_outcome=config.get("log_outcome", False),
     )
     panel.to_csv(outdir / "panel.csv", index=False)
 
@@ -201,7 +215,11 @@ def run_live(config: dict, outdir: Path):
         panel, min_e, max_e, config.get("n_boot", 1000),
         config.get("comparison", "notyettreated"), config.get("seed", 7),
     )
-    plot_event_study(cs.event_study, outdir / "event_study.png", sa=sa, twfe=twfe)
+    ylabel = ("ATT (log monthly violent offenses)" if config.get("log_outcome")
+              else "ATT (violent offenses per agency-month)")
+    plot_event_study(cs.event_study, outdir / "event_study.png", sa=sa, twfe=twfe,
+                     title="Effect of curfew adoption/tightening on violent crime "
+                           "(FBI CDE, 9 cities)", ylabel=ylabel)
     _write_outputs(outdir, cs, sa, twfe, mode="live", extra={
         "n_agencies": int(panel["unit"].nunique()),
         "n_periods": int(panel["period"].nunique()),

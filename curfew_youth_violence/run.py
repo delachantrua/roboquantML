@@ -43,11 +43,19 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Choose mode: explicit --simulate, or auto-fallback when no API key is set.
-    use_sim = args.simulate or not os.environ.get("FBI_CDE_API_KEY")
+    # Choose mode: explicit --simulate, else live if we have a data source
+    # (cached counts file in the config, or an API key), else simulation.
+    config = None
+    if not args.simulate and os.path.exists(args.config):
+        with open(args.config) as fh:
+            config = yaml.safe_load(fh)
+    has_source = bool(os.environ.get("FBI_CDE_API_KEY")) or bool(
+        config and (config.get("counts_file") or config.get("incident_file"))
+    )
+    use_sim = args.simulate or not has_source
     if use_sim and not args.simulate:
-        print("No FBI_CDE_API_KEY found -> running in simulation mode. "
-              "Set the key and pass --config for live data.\n")
+        print("No FBI_CDE_API_KEY and no cached counts_file -> simulation mode. "
+              "Set the key or counts_file and pass --config for live data.\n")
 
     if use_sim:
         n_boot = args.n_boot or 1000
@@ -64,8 +72,6 @@ def main():
                   f"{verdict['noncurfew_overall_att']:+.2f} (z {verdict['noncurfew_z']:+.1f}) | "
                   f"clean = {verdict['clean_falsification']}")
     else:
-        with open(args.config) as fh:
-            config = yaml.safe_load(fh)
         if args.n_boot:
             config["n_boot"] = args.n_boot
         if config.get("incident_file") and not args.no_falsification:
